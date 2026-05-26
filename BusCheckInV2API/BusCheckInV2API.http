@@ -1,0 +1,6 @@
+@BusCheckInV2API_HostAddress = http://localhost:5030
+
+GET {{BusCheckInV2API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
