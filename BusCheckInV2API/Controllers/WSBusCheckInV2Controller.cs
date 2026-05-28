@@ -52,8 +52,10 @@ namespace BusCheckInV2API.Controllers
 
                 using var cmd = new SqlCommand(consulta, con);
                 // CORREGIDO: Uso de Add con SqlDbType explícito en lugar de AddWithValue
-                cmd.Parameters.Add("@FlePer_Fecha", SqlDbType.DateTime).Value = request.Fecha;
-                cmd.Parameters.Add("@FlePer_Hora", SqlDbType.Time).Value = request.Hora;
+                //cmd.Parameters.Add("@FlePer_Fecha", SqlDbType.DateTime).Value = request.Fecha;
+                //cmd.Parameters.Add("@FlePer_Hora", SqlDbType.Time).Value = request.Hora;
+                DateTime fecha = DateTime.TryParse(request.Fecha, out var f) ? f : DateTime.Now;
+                TimeSpan hora = TimeSpan.TryParse(request.Hora, out var h) ? h : DateTime.Now.TimeOfDay;
                 cmd.Parameters.Add("@Prov_Clave", SqlDbType.VarChar).Value = request.ClaveProveedor;
                 cmd.Parameters.Add("@IdDestFlete", SqlDbType.Int).Value = request.IdDestFlete;
                 cmd.Parameters.Add("@FlePer_TipoFlete", SqlDbType.VarChar).Value = request.TipoFlete;
@@ -645,8 +647,10 @@ namespace BusCheckInV2API.Controllers
 
                         using var cmd = new SqlCommand(query, con);
                         cmd.Parameters.Add("@IdFletePer", SqlDbType.Int).Value = flete.IdFletePer;
-                        cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = flete.Fecha;
-                        cmd.Parameters.Add("@Hora", SqlDbType.Time).Value = flete.Hora;
+                        //cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = flete.Fecha;
+                        //cmd.Parameters.Add("@Hora", SqlDbType.Time).Value = flete.Hora;
+                        DateTime fecha = DateTime.TryParse(flete.Fecha.ToString(), out var f) ? f : DateTime.Now;
+                        TimeSpan hora = flete.Hora;
                         cmd.Parameters.Add("@ProvClave", SqlDbType.VarChar).Value = flete.ProvClave;
                         cmd.Parameters.Add("@IdDestFlete", SqlDbType.Int).Value = flete.IdDestFlete;
                         cmd.Parameters.Add("@TipoFlete", SqlDbType.VarChar).Value = flete.TipoFlete;
