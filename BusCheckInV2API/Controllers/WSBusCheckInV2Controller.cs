@@ -35,49 +35,105 @@ namespace BusCheckInV2API.Controllers
 
         // POST: api/WSBusCheckInV2/InsertarFletePersonal
         [HttpPost("InsertarFletePersonal")]
-        public async Task<IActionResult> InsertarTb_FlePer_FletePersonal([FromBody] FletePersonalRequest request)
+        public async Task<IActionResult> InsertarTb_FlePer_FletePersonal(
+    [FromBody] FletePersonalRequest request)
         {
-            // CORREGIDO: Validación de nulo añadida
-            if (request == null) return BadRequest(new ApiResponse<object> { Success = false, Message = "Petición inválida" });
+            if (request == null)
+                return BadRequest(new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Petición inválida"
+                });
 
             try
             {
                 using var con = new SqlConnection(_connectionString);
                 await con.OpenAsync();
 
+                // Sin TRY_CAST: ya convertimos a los tipos correctos en C#
                 const string consulta = @"
-                    INSERT INTO Tb_FlePer_FletePersonal (FlePer_Fecha, FlePer_Hora, Prov_Clave, IdDestFlete, FlePer_TipoFlete, FlePer_TipoViaje, FlePer_Cantidad, FlePer_Status, FlePer_Chofer)
-                    VALUES (TRY_CAST(@FlePer_Fecha as DATETIME), TRY_CAST(@FlePer_Hora as TIME), @Prov_Clave, @IdDestFlete, @FlePer_TipoFlete, @FlePer_TipoViaje, @FlePer_Cantidad, @FlePer_Status, @FlePer_Chofer);
-                    SELECT SCOPE_IDENTITY();";
+            INSERT INTO Tb_FlePer_FletePersonal
+                (FlePer_Fecha, FlePer_Hora, Prov_Clave, IdDestFlete,
+                 FlePer_TipoFlete, FlePer_TipoViaje, FlePer_Cantidad,
+                 FlePer_Status, FlePer_Chofer)
+            VALUES
+                (@FlePer_Fecha, @FlePer_Hora, @Prov_Clave, @IdDestFlete,
+                 @FlePer_TipoFlete, @FlePer_TipoViaje, @FlePer_Cantidad,
+                 @FlePer_Status, @FlePer_Chofer);
+            SELECT CAST(SCOPE_IDENTITY() AS BIGINT);";
+
+                // Parseo defensivo: si el cliente manda mal formato usamos ahora
+                DateTime fecha = DateTime.TryParse(request.Fecha, out var f)
+                    ? f : DateTime.Now;
+                TimeSpan hora = TimeSpan.TryParse(request.Hora, out var h)
+                    ? h : DateTime.Now.TimeOfDay;
 
                 using var cmd = new SqlCommand(consulta, con);
-                // CORREGIDO: Uso de Add con SqlDbType explícito en lugar de AddWithValue
-                //cmd.Parameters.Add("@FlePer_Fecha", SqlDbType.DateTime).Value = request.Fecha;
-                //cmd.Parameters.Add("@FlePer_Hora", SqlDbType.Time).Value = request.Hora;
-                DateTime fecha = DateTime.TryParse(request.Fecha, out var f) ? f : DateTime.Now;
-                TimeSpan hora = TimeSpan.TryParse(request.Hora, out var h) ? h : DateTime.Now.TimeOfDay;
-                cmd.Parameters.Add("@Prov_Clave", SqlDbType.VarChar).Value = request.ClaveProveedor;
+
+                // ── CORRECCIÓN CRÍTICA: los parámetros ahora SÍ se agregan ──────
+                cmd.Parameters.Add("@FlePer_Fecha", SqlDbType.DateTime).Value = fecha;
+                cmd.Parameters.Add("@FlePer_Hora", SqlDbType.Time).Value = hora;
+                cmd.Parameters.Add("@Prov_Clave", SqlDbType.VarChar, 10).Value = request.ClaveProveedor ?? string.Empty;
                 cmd.Parameters.Add("@IdDestFlete", SqlDbType.Int).Value = request.IdDestFlete;
-                cmd.Parameters.Add("@FlePer_TipoFlete", SqlDbType.VarChar).Value = request.TipoFlete;
-                cmd.Parameters.Add("@FlePer_TipoViaje", SqlDbType.VarChar).Value = request.TipoViaje;
+                cmd.Parameters.Add("@FlePer_TipoFlete", SqlDbType.VarChar, 15).Value = request.TipoFlete ?? "NORMAL";
+                cmd.Parameters.Add("@FlePer_TipoViaje", SqlDbType.VarChar, 15).Value = request.TipoViaje ?? "TRAER GENTE";
                 cmd.Parameters.Add("@FlePer_Cantidad", SqlDbType.Int).Value = request.Cantidad;
-                cmd.Parameters.Add("@FlePer_Status", SqlDbType.VarChar).Value = request.Estatus;
-                cmd.Parameters.Add("@FlePer_Chofer", SqlDbType.VarChar).Value = (object)request.Chofer ?? DBNull.Value;
+                cmd.Parameters.Add("@FlePer_Status", SqlDbType.VarChar, 1).Value = request.Estatus ?? "P";
+                cmd.Parameters.Add("@FlePer_Chofer", SqlDbType.VarChar, 30).Value =
+                    string.IsNullOrWhiteSpace(request.Chofer)
+                        ? (object)DBNull.Value
+                        : request.Chofer.Trim();
 
-                var resultado = await EjecutarConsultaAsync(cmd);
+                var raw = await cmd.ExecuteScalarAsync();
+                long idGenerado = (raw != null && raw != DBNull.Value)
+                    ? Convert.ToInt64(raw)
+                    : 0;
 
-                // CORREGIDO: Retornar ApiResponse<long> en lugar de string plano
+                if (idGenerado <= 0)
+                {
+                    _logger.LogError(
+                        "InsertarFletePersonal: SCOPE_IDENTITY() devolvió {Id} " +
+                        "(Fecha={Fecha}, Hora={Hora}, Chofer={Chofer})",
+                        idGenerado, fecha, hora, request.Chofer);
+
+                    return StatusCode(500, new ApiResponse<object>
+                    {
+                        Success = false,
+                        Message = "El servidor no generó un ID válido para el flete"
+                    });
+                }
+
+                _logger.LogInformation(
+                    "Flete insertado: IdFletePer={Id}, Chofer={Chofer}, Fecha={Fecha}",
+                    idGenerado, request.Chofer, fecha.ToString("yyyy-MM-dd"));
+
                 return Ok(new ApiResponse<long>
                 {
                     Success = true,
-                    Data = resultado,
+                    Data = idGenerado,
                     Message = "Flete insertado correctamente"
+                });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx,
+                    "SQL Error en InsertarFletePersonal (Number={Num}): {Msg}",
+                    sqlEx.Number, sqlEx.Message);
+
+                return StatusCode(500, new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = $"Error de base de datos [{sqlEx.Number}]"
                 });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error al insertar registro");
-                return StatusCode(500, new ApiResponse<object> { Success = false, Message = "Error al insertar registro" });
+                _logger.LogError(ex, "Error inesperado en InsertarFletePersonal");
+                return StatusCode(500, new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Error interno del servidor"
+                });
             }
         }
 
@@ -609,7 +665,12 @@ namespace BusCheckInV2API.Controllers
         [HttpPost("SincronizarFletes")]
         public async Task<IActionResult> SincronizarFletes([FromBody] List<SincronizacionRequest> request)
         {
-            if (request == null || !request.Any()) return BadRequest(new ApiResponse<object> { Success = false, Message = "Petición inválida o vacía" });
+            if (request == null || request.Count == 0)
+                return BadRequest(new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Petición inválida o vacía"
+                });
 
             try
             {
@@ -623,66 +684,111 @@ namespace BusCheckInV2API.Controllers
                 {
                     try
                     {
-                        const string checkQuery = "SELECT COUNT(*) FROM Tb_FlePer_FletePersonal WHERE IdFletePer = @IdFletePer";
+                        // ── Parseo defensivo de tipos temporales ─────────────────
+                        DateTime fecha = DateTime.TryParse(flete.Fecha, out var f)
+                            ? f : DateTime.Now;
+                        TimeSpan hora = TimeSpan.TryParse(flete.Hora, out var h)
+                            ? h : DateTime.Now.TimeOfDay;
+
+                        // ── Verificar si ya existe el registro ───────────────────
+                        const string checkQuery =
+                            "SELECT COUNT(1) FROM Tb_FlePer_FletePersonal " +
+                            "WHERE IdFletePer = @IdFletePer";
+
                         using var checkCmd = new SqlCommand(checkQuery, con);
                         checkCmd.Parameters.Add("@IdFletePer", SqlDbType.Int).Value = flete.IdFletePer;
+                        bool existe = Convert.ToInt32(await checkCmd.ExecuteScalarAsync()) > 0;
 
-                        var existe = Convert.ToInt32(await checkCmd.ExecuteScalarAsync()) > 0;
+                        // ── Queries con @Fecha y @Hora INCLUIDOS ─────────────────
+                        const string updateQuery = @"
+                    UPDATE Tb_FlePer_FletePersonal
+                    SET FlePer_Fecha         = @Fecha,
+                        FlePer_Hora          = @Hora,
+                        Prov_Clave           = @ProvClave,
+                        IdDestFlete          = @IdDestFlete,
+                        FlePer_TipoFlete     = @TipoFlete,
+                        FlePer_TipoViaje     = @TipoViaje,
+                        FlePer_Cantidad      = @Cantidad,
+                        FlePer_Status        = @Status,
+                        FlePer_Chofer        = @Chofer,
+                        FlePer_Observaciones = @Observaciones
+                    WHERE IdFletePer = @IdFletePer";
 
-                        string query;
-                        if (existe)
-                        {
-                            query = @"UPDATE Tb_FlePer_FletePersonal 
-                                      SET FlePer_Fecha = @Fecha, FlePer_Hora = @Hora, Prov_Clave = @ProvClave, IdDestFlete = @IdDestFlete, 
-                                          FlePer_TipoFlete = @TipoFlete, FlePer_TipoViaje = @TipoViaje, FlePer_Cantidad = @Cantidad, 
-                                          FlePer_Status = @Status, FlePer_Chofer = @Chofer, FlePer_Observaciones = @Observaciones
-                                      WHERE IdFletePer = @IdFletePer";
-                        }
-                        else
-                        {
-                            query = @"INSERT INTO Tb_FlePer_FletePersonal 
-                                      (IdFletePer, FlePer_Fecha, FlePer_Hora, Prov_Clave, IdDestFlete, FlePer_TipoFlete, FlePer_TipoViaje, FlePer_Cantidad, FlePer_Status, FlePer_Chofer, FlePer_Observaciones)
-                                      VALUES (@IdFletePer, @Fecha, @Hora, @ProvClave, @IdDestFlete, @TipoFlete, @TipoViaje, @Cantidad, @Status, @Chofer, @Observaciones)";
-                        }
+                        const string insertQuery = @"
+                    INSERT INTO Tb_FlePer_FletePersonal
+                        (IdFletePer, FlePer_Fecha, FlePer_Hora, Prov_Clave,
+                         IdDestFlete, FlePer_TipoFlete, FlePer_TipoViaje,
+                         FlePer_Cantidad, FlePer_Status, FlePer_Chofer,
+                         FlePer_Observaciones)
+                    VALUES
+                        (@IdFletePer, @Fecha, @Hora, @ProvClave,
+                         @IdDestFlete, @TipoFlete, @TipoViaje,
+                         @Cantidad, @Status, @Chofer,
+                         @Observaciones)";
 
-                        using var cmd = new SqlCommand(query, con);
+                        using var cmd = new SqlCommand(existe ? updateQuery : insertQuery, con);
+
+                        // ── CORRECCIÓN CRÍTICA: TODOS los parámetros agregados ───
                         cmd.Parameters.Add("@IdFletePer", SqlDbType.Int).Value = flete.IdFletePer;
-                        //cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = flete.Fecha;
-                        //cmd.Parameters.Add("@Hora", SqlDbType.Time).Value = flete.Hora;
-                        DateTime fecha = DateTime.TryParse(flete.Fecha.ToString(), out var f) ? f : DateTime.Now;
-                        TimeSpan hora = flete.Hora;
-                        cmd.Parameters.Add("@ProvClave", SqlDbType.VarChar).Value = flete.ProvClave;
+                        cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = fecha;   // ← antes faltaba
+                        cmd.Parameters.Add("@Hora", SqlDbType.Time).Value = hora;    // ← antes faltaba
+                        cmd.Parameters.Add("@ProvClave", SqlDbType.VarChar, 10).Value = flete.ProvClave ?? string.Empty;
                         cmd.Parameters.Add("@IdDestFlete", SqlDbType.Int).Value = flete.IdDestFlete;
-                        cmd.Parameters.Add("@TipoFlete", SqlDbType.VarChar).Value = flete.TipoFlete;
-                        cmd.Parameters.Add("@TipoViaje", SqlDbType.VarChar).Value = flete.TipoViaje;
+                        cmd.Parameters.Add("@TipoFlete", SqlDbType.VarChar, 15).Value = flete.TipoFlete ?? "NORMAL";
+                        cmd.Parameters.Add("@TipoViaje", SqlDbType.VarChar, 15).Value = flete.TipoViaje ?? "TRAER GENTE";
                         cmd.Parameters.Add("@Cantidad", SqlDbType.Int).Value = flete.Cantidad;
-                        cmd.Parameters.Add("@Status", SqlDbType.VarChar).Value = flete.Status;
-                        cmd.Parameters.Add("@Chofer", SqlDbType.VarChar).Value = (object)flete.Chofer ?? DBNull.Value;
-                        cmd.Parameters.Add("@Observaciones", SqlDbType.VarChar).Value = (object)flete.Observaciones ?? DBNull.Value;
+                        cmd.Parameters.Add("@Status", SqlDbType.VarChar, 1).Value = flete.Status ?? "P";
+                        cmd.Parameters.Add("@Chofer", SqlDbType.VarChar, 30).Value =
+                            string.IsNullOrWhiteSpace(flete.Chofer)
+                                ? (object)DBNull.Value
+                                : flete.Chofer.Trim();
+                        cmd.Parameters.Add("@Observaciones", SqlDbType.VarChar).Value =
+                            string.IsNullOrWhiteSpace(flete.Observaciones)
+                                ? (object)DBNull.Value
+                                : flete.Observaciones;
 
                         await cmd.ExecuteNonQueryAsync();
                         exitosos++;
 
-                        resultados.Add(new SincronizacionResult { IdFletePer = flete.IdFletePer, Success = true, Message = existe ? "Actualizado" : "Insertado" });
+                        resultados.Add(new SincronizacionResult
+                        {
+                            IdFletePer = flete.IdFletePer,
+                            Success = true,
+                            Message = existe ? "Actualizado" : "Insertado"
+                        });
+
+                        _logger.LogInformation(
+                            "Flete {Id} {Accion} correctamente",
+                            flete.IdFletePer, existe ? "actualizado" : "insertado");
                     }
                     catch (Exception ex)
                     {
-                        resultados.Add(new SincronizacionResult { IdFletePer = flete.IdFletePer, Success = false, Message = $"Error: {ex.Message}" });
-                        _logger.LogError(ex, $"Error sincronizando flete {flete.IdFletePer}");
+                        resultados.Add(new SincronizacionResult
+                        {
+                            IdFletePer = flete.IdFletePer,
+                            Success = false,
+                            Message = $"Error: {ex.Message}"
+                        });
+                        _logger.LogError(ex,
+                            "Error sincronizando flete {Id}", flete.IdFletePer);
                     }
                 }
 
                 return Ok(new ApiResponse<List<SincronizacionResult>>
                 {
-                    Success = true,
+                    Success = exitosos > 0,
                     Data = resultados,
-                    Message = $"Sincronización completada: {exitosos} exitosos de {request.Count}"
+                    Message = $"Sincronización: {exitosos} exitosos de {request.Count}"
                 });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error en SincronizarFletes");
-                return StatusCode(500, new ApiResponse<object> { Success = false, Message = "Error en sincronización" });
+                _logger.LogError(ex, "Error general en SincronizarFletes");
+                return StatusCode(500, new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Error en sincronización"
+                });
             }
         }
 
