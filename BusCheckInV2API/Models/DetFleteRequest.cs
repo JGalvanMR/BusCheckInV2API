@@ -7,6 +7,6 @@
         public double FlePer_Latitud { get; set; }
         public double FlePer_Longitud { get; set; }
         public DateTime FlePer_Fecha { get; set; }
-        public string FlePer_Nombre { get; set; }
+        public string? FlePer_Nombre { get; set; }
     }
 }

@@ -301,6 +301,126 @@ namespace BusCheckInV2API.Controllers
                 return StatusCode(500, new ApiResponse<object> { Success = false, Message = "Error interno del servidor" });
             }
         }
+
+        // POST: api/WSBusCheckInV2/SincronizarDetFletes
+        [HttpPost("SincronizarDetFletes")]
+        public async Task<IActionResult> SincronizarDetFletes(
+            [FromBody] DetFletesBatchRequest request)
+        {
+            if (request == null || request.Items == null || request.Items.Count == 0)
+                return BadRequest(new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Petición vacía o inválida"
+                });
+
+            int totalInsertados = 0;
+            var localIdsFallidos = new List<int>();
+
+            try
+            {
+                using var con = new SqlConnection(_connectionString);
+                await con.OpenAsync();
+
+                // ── Una transacción por todo el lote ─────────────────────────────
+                // Si falla el insert #25 de 40, el rollback deja todo en estado
+                // consistente. El cliente reintentará todo el lote la próxima vez.
+                using var transaction = await con.BeginTransactionAsync();
+
+                try
+                {
+                    // Query que busca el nombre y depto del empleado en la misma inserción
+                    const string query = @"
+                INSERT INTO TB_FlePer_DetFlete
+                    (IdFletePer, FlePer_CveNomina, FlePer_Latitud, FlePer_Longitud,
+                     FlePer_Fecha, FlePer_Nombre, FlePer_Depto)
+                SELECT
+                    @IdFletePer,
+                    @FlePer_CveNomina,
+                    @FlePer_Latitud,
+                    @FlePer_Longitud,
+                    @FlePer_Fecha,
+                    CONCAT(
+                        LTRIM(RTRIM(e.emp_nombre)),   ' ',
+                        LTRIM(RTRIM(e.emp_paterno)),  ' ',
+                        LTRIM(RTRIM(e.emp_materno))),
+                    LTRIM(RTRIM(d.dep_nombre))
+                FROM tb_cat_empleados e
+                LEFT JOIN tb_cat_departamentos d ON d.dep_folio = e.emp_depto
+                WHERE e.emp_clave = @FlePer_CveNomina
+                  AND NOT EXISTS (
+                      SELECT 1 FROM TB_FlePer_DetFlete
+                      WHERE IdFletePer      = @IdFletePer
+                        AND FlePer_CveNomina = @FlePer_CveNomina
+                  );";
+
+                    foreach (var item in request.Items)
+                    {
+                        using var cmd = new SqlCommand(query, con,
+                            (SqlTransaction)transaction);
+
+                        cmd.Parameters.Add("@IdFletePer", SqlDbType.Int).Value = request.IdFletePer;
+                        cmd.Parameters.Add("@FlePer_CveNomina", SqlDbType.Int).Value = item.FlePer_CveNomina;
+                        cmd.Parameters.Add("@FlePer_Latitud", SqlDbType.Decimal).Value = (decimal)item.FlePer_Latitud;
+                        cmd.Parameters.Add("@FlePer_Longitud", SqlDbType.Decimal).Value = (decimal)item.FlePer_Longitud;
+                        cmd.Parameters.Add("@FlePer_Fecha", SqlDbType.DateTime).Value = item.FlePer_Fecha;
+
+                        int rows = await cmd.ExecuteNonQueryAsync();
+
+                        if (rows > 0)
+                            totalInsertados++;
+                        else
+                        {
+                            // 0 rows = empleado no encontrado O ya existía (NOT EXISTS).
+                            // Ambos casos son "manejados": marcamos como fallido
+                            // solo para el reporte, pero no abortamos la transacción.
+                            localIdsFallidos.Add(item.LocalId);
+                            _logger.LogWarning(
+                                "DetFlete no insertado: Nomina={Nom}, Flete={Id} (ya existía o empleado no encontrado)",
+                                item.FlePer_CveNomina, request.IdFletePer);
+                        }
+                    }
+
+                    await transaction.CommitAsync();
+
+                    _logger.LogInformation(
+                        "SincronizarDetFletes: IdFletePer={Id}, " +
+                        "Insertados={Ins}, NoInsertados={No}",
+                        request.IdFletePer, totalInsertados, localIdsFallidos.Count);
+
+                    return Ok(new ApiResponse<DetFletesBatchResult>
+                    {
+                        Success = true,
+                        Data = new DetFletesBatchResult
+                        {
+                            Success = true,
+                            TotalInsertados = totalInsertados,
+                            TotalFallidos = localIdsFallidos.Count,
+                            LocalIdsFallidos = localIdsFallidos,
+                            Message = $"Batch completado: {totalInsertados} insertados, " +
+                                      $"{localIdsFallidos.Count} omitidos"
+                        },
+                        Message = "Sincronización batch exitosa"
+                    });
+                }
+                catch (Exception ex)
+                {
+                    await transaction.RollbackAsync();
+                    _logger.LogError(ex, "Rollback en SincronizarDetFletes para flete {Id}",
+                        request.IdFletePer);
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error en SincronizarDetFletes");
+                return StatusCode(500, new ApiResponse<object>
+                {
+                    Success = false,
+                    Message = "Error al sincronizar detalle de flete"
+                });
+            }
+        }
         #endregion
 
         // GET: api/WSBusCheckInV2/HelloWorld
@@ -322,26 +442,29 @@ namespace BusCheckInV2API.Controllers
 
                 const string query = @"
                     WITH FletesConEstado AS (
-                        SELECT
-                            fp.IdFletePer,
-                            fp.FlePer_Chofer,
-                            CASE
-                                WHEN EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 0)
-                                     AND NOT EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 9999 AND df.FlePer_Nombre = 'FIN')
-                                THEN 1 ELSE 0
-                            END AS EsPendiente
-                        FROM Tb_FlePer_FletePersonal fp
-                        WHERE fp.FlePer_Chofer IS NOT NULL
-                          AND LTRIM(RTRIM(fp.FlePer_Chofer)) <> '' 
-                          AND fp.FlePer_Fecha >= DATEADD(DAY, -7, CAST(GETDATE() AS DATE))
-                    )
-                    SELECT
-                        FlePer_Chofer AS Nombre,
-                        COUNT(*) AS TotalFletes,
-                        SUM(EsPendiente) AS FletesPendientes
+                       SELECT
+                        fp.IdFletePer,
+                        fp.FlePer_Chofer,
+                        CASE
+                            WHEN fp.FlePer_Status = 'P'
+                                OR (
+                                    EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 0)
+                                    AND NOT EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 9999 AND df.FlePer_Nombre = 'FIN')
+                                )
+                            THEN 1 ELSE 0
+                        END AS EsPendiente
+                       FROM Tb_FlePer_FletePersonal fp
+                       WHERE fp.FlePer_Chofer IS NOT NULL
+                        AND LTRIM(RTRIM(fp.FlePer_Chofer)) <> '' 
+                        AND fp.FlePer_Fecha >= DATEADD(DAY, -7, CAST(GETDATE() AS DATE))
+                )
+                SELECT
+                    FlePer_Chofer AS Nombre,
+                    COUNT(*) AS TotalFletes,
+                    SUM(EsPendiente) AS FletesPendientes
                     FROM FletesConEstado
-                    GROUP BY FlePer_Chofer
-                    ORDER BY FlePer_Chofer;";
+                GROUP BY FlePer_Chofer
+                ORDER BY FlePer_Chofer;";
 
                 using var cmd = new SqlCommand(query, con);
                 using var reader = await cmd.ExecuteReaderAsync();
@@ -372,7 +495,7 @@ namespace BusCheckInV2API.Controllers
         }
 
         [HttpGet("ObtenerFletesPorChoferTodos")]
-        public async Task<IActionResult> ObtenerFletesPorChoferTodos(string chofer, int dias = 3)
+        public async Task<IActionResult> ObtenerFletesPorChoferTodos(string chofer, int dias = 7)
         {
             try
             {
