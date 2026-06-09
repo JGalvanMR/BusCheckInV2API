@@ -1,5 +1,4 @@
-﻿using BusCheckInV2.Models;
-using BusCheckInV2API.Models;
+﻿using BusCheckInV2API.Models;
 using Microsoft.AspNetCore.Mvc;
 // CORREGIDO: Se eliminó el using System.Data.SqlClient (obsoleto) para evitar conflictos
 using Microsoft.Data.SqlClient;
@@ -692,19 +691,29 @@ namespace BusCheckInV2API.Controllers
                 using var con = new SqlConnection(_connectionString);
                 await con.OpenAsync();
 
-                // FIX NIVEL 2 #19 + #23: agrego EsPendiente derivado en el SELECT
-                // para que el cliente no tenga que adivinarlo combinando campos.
-                // La lógica es EXACTAMENTE la que el cliente ya usa
-                // (Estatus='P' OR (TieneInicio AND NOT TieneFin)) con la
-                // adición clave: también se considera pendiente un flete en
-                // estado 'I' (Reanudado) o 'P' (Pendiente) que aún no tiene
-                // FIN. Esto cierra el bug #5 donde un flete recién creado y
-                // no sincronizado (sin INICIO en el servidor) quedaba oculto
-                // por el toggle "Solo pendientes".
+                // FIX 2026-06-03 (Opción A — modelo de 2 Status + 4 estados derivados):
+                // El usuario aclara que FlePer_Status solo toma 2 valores:
+                //   'A' = Activo (flete "vivo" en general)
+                //   'C' = Cancelado
+                // Los 4 estados conceptuales (Activo, En curso, Pendiente,
+                // Finalizado, Cancelado) se DERIVAN de los detalles del
+                // flete. Calculamos aquí 3 campos nuevos:
+                //   CantPasajeros      = count detalles con CveNomina NOT IN (0, 9999)
+                //   UltimaFechaDetalle  = MAX(FlePer_Fecha) de los detalles
+                //   EstadoCalculado     = string para mostrar en UI:
+                //                          'Activo'       → Status='A' sin INICIO
+                //                          'En curso'     → Status='A' INICIO + >=1 pasajero <5h
+                //                          'Pendiente'    → Status='A' o 'C' con INICIO + >=1 pasajero >=5h
+                //                          'Finalizado'   → Status='A' con FIN (CveNomina=9999 Nombre='FIN')
+                //                          'Cancelado'    → Status='C' sin pasajeros (solo INICIO o INICIO+FIN sin medio)
                 //
-                // FIX NIVEL 1 #5: el WHERE de soloPendientes ahora incluye
-                // Estatus IN ('P','I') para que un flete en curso pero sin
-                // INICIO/FIN subidos al servidor también aparezca.
+                // La regla de "5 horas" es aproximada: usamos la columna
+                // UltimaFechaDetalle para calcular el tiempo transcurrido.
+                //
+                // Mantengo EsPendiente (Nivel 2 #19+#23) para retrocompat con
+                // el cliente que ya lo consume: vale 1 si el flete NO está
+                // Cancelado puro. El cliente puede usar EsPendiente O
+                // EstadoCalculado (este último es más rico).
                 string query = @"
                     SELECT
                         fp.IdFletePer, fp.FlePer_Fecha, fp.FlePer_Hora, fp.Prov_Clave, p.prov_nombre AS NombreProveedor,
@@ -712,13 +721,63 @@ namespace BusCheckInV2API.Controllers
                         fp.FlePer_Cantidad, fp.FlePer_Status, fp.FlePer_Chofer,
                         (SELECT COUNT(*) FROM Tb_FlePer_DetFlete dfx WHERE dfx.IdFletePer = fp.IdFletePer) AS PuntosRegistrados,
                         CASE WHEN EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete WHERE IdFletePer = fp.IdFletePer AND FlePer_CveNomina = 0) THEN 1 ELSE 0 END AS TieneInicio,
-                        CASE WHEN EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete WHERE IdFletePer = fp.IdFletePer AND FlePer_CveNomina = 9999) THEN 1 ELSE 0 END AS TieneFin,
+                        CASE WHEN EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete WHERE IdFletePer = fp.IdFletePer AND FlePer_CveNomina = 9999 AND FlePer_Nombre = 'FIN') THEN 1 ELSE 0 END AS TieneFin,
+                        -- CantPasajeros: detalles excluyendo INICIO (0) y FIN (9999)
+                        (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                            WHERE IdFletePer = fp.IdFletePer
+                              AND FlePer_CveNomina NOT IN (0, 9999)) AS CantPasajeros,
+                        -- UltimaFechaDetalle: timestamp del último registro (cualquiera)
+                        (SELECT MAX(FlePer_Fecha) FROM Tb_FlePer_DetFlete
+                            WHERE IdFletePer = fp.IdFletePer) AS UltimaFechaDetalle,
+                        -- EstadoCalculado: aplica las reglas de negocio
                         CASE
-                            WHEN fp.FlePer_Status IN ('P','I') THEN 1
-                            WHEN (EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete WHERE IdFletePer = fp.IdFletePer AND FlePer_CveNomina = 0)
-                                  AND NOT EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete WHERE IdFletePer = fp.IdFletePer AND FlePer_CveNomina = 9999))
-                            THEN 1
-                            ELSE 0
+                            WHEN fp.FlePer_Status = 'C' AND
+                                 (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                                    WHERE IdFletePer = fp.IdFletePer
+                                      AND FlePer_CveNomina NOT IN (0, 9999)) = 0
+                            THEN 'Cancelado'
+                            WHEN fp.FlePer_Status = 'C' THEN 'Pendiente'
+                            WHEN fp.FlePer_Status = 'A' AND
+                                 EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete
+                                          WHERE IdFletePer = fp.IdFletePer
+                                            AND FlePer_CveNomina = 9999
+                                            AND FlePer_Nombre = 'FIN')
+                            THEN 'Finalizado'
+                            WHEN fp.FlePer_Status = 'A' AND
+                                 EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete
+                                          WHERE IdFletePer = fp.IdFletePer
+                                            AND FlePer_CveNomina = 0) AND
+                                 (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                                    WHERE IdFletePer = fp.IdFletePer
+                                      AND FlePer_CveNomina NOT IN (0, 9999)) > 0 AND
+                                 DATEDIFF(HOUR,
+                                    (SELECT MAX(FlePer_Fecha) FROM Tb_FlePer_DetFlete
+                                       WHERE IdFletePer = fp.IdFletePer),
+                                    GETDATE()) < 5
+                            THEN 'En curso'
+                            WHEN fp.FlePer_Status = 'A' AND
+                                 EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete
+                                          WHERE IdFletePer = fp.IdFletePer
+                                            AND FlePer_CveNomina = 0) AND
+                                 (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                                    WHERE IdFletePer = fp.IdFletePer
+                                      AND FlePer_CveNomina NOT IN (0, 9999)) > 0
+                            THEN 'Pendiente'
+                            WHEN fp.FlePer_Status = 'A' AND
+                                 EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete
+                                          WHERE IdFletePer = fp.IdFletePer
+                                            AND FlePer_CveNomina = 0)
+                            THEN 'Pendiente'
+                            ELSE 'Activo'
+                        END AS EstadoCalculado,
+                        -- EsPendiente (Nivel 2 #19+#23): retrocompat
+                        CASE
+                            WHEN fp.FlePer_Status = 'C' AND
+                                 (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                                    WHERE IdFletePer = fp.IdFletePer
+                                      AND FlePer_CveNomina NOT IN (0, 9999)) = 0
+                            THEN 0
+                            ELSE 1
                         END AS EsPendiente
                     FROM Tb_FlePer_FletePersonal fp
                     LEFT JOIN Tb_Cat_Proveedor p ON fp.Prov_Clave = p.prov_clave
@@ -728,15 +787,16 @@ namespace BusCheckInV2API.Controllers
 
                 if (soloPendientes)
                 {
-                    // FIX NIVEL 1 #5: ampliar el filtro para incluir fletes
-                    // en estado P/I aunque no tengan INICIO/FIN subidos.
+                    // FIX 2026-06-03 (Opción A): con el nuevo modelo, "pendiente"
+                    // = todo lo que NO es Cancelado puro. El toggle "Solo
+                    // pendientes" oculta Cancelados, no Finalizados (un
+                    // flete finalizado sigue siendo relevante para consulta).
                     query += @"
-                        AND (
-                            fp.FlePer_Status IN ('P','I')
-                            OR (
-                                EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 0)
-                                AND NOT EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 9999)
-                            )
+                        AND NOT (
+                            fp.FlePer_Status = 'C' AND
+                            (SELECT COUNT(*) FROM Tb_FlePer_DetFlete
+                                WHERE IdFletePer = fp.IdFletePer
+                                  AND FlePer_CveNomina NOT IN (0, 9999)) = 0
                         ) ";
                 }
 
@@ -768,6 +828,11 @@ namespace BusCheckInV2API.Controllers
                         PuntosRegistrados = reader["PuntosRegistrados"] != DBNull.Value ? Convert.ToInt32(reader["PuntosRegistrados"]) : 0,
                         TieneInicio = reader["TieneInicio"] != DBNull.Value ? Convert.ToInt32(reader["TieneInicio"]) : 0,
                         TieneFin = reader["TieneFin"] != DBNull.Value ? Convert.ToInt32(reader["TieneFin"]) : 0,
+                        // FIX 2026-06-03 (Opción A): mapeo de los 3 campos
+                        // nuevos que se calculan en el SELECT.
+                        CantPasajeros = reader["CantPasajeros"] != DBNull.Value ? Convert.ToInt32(reader["CantPasajeros"]) : 0,
+                        UltimaFechaDetalle = reader["UltimaFechaDetalle"] != DBNull.Value ? Convert.ToDateTime(reader["UltimaFechaDetalle"]) : (DateTime?)null,
+                        EstadoCalculado = reader["EstadoCalculado"]?.ToString() ?? "Activo",
                         // FIX NIVEL 2 #19: exponer EsPendiente derivado para
                         // que el cliente no tenga que recalcularlo.
                         EsPendiente = reader["EsPendiente"] != DBNull.Value ? Convert.ToInt32(reader["EsPendiente"]) : 0
