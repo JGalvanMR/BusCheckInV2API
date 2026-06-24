@@ -515,9 +515,9 @@ namespace BusCheckInV2API.Controllers
         }
 
         #region ENDPOINT FLETES PENDIENTES
-        // GET: api/WSBusCheckInV2/ObtenerUsuarios
-        [HttpGet("ObtenerUsuarios")]
-        public async Task<IActionResult> ObtenerUsuarios()
+        // GET: api/WSBusCheckInV2/ObtenerUsuariosOG
+        [HttpGet("ObtenerUsuariosOG")]
+        public async Task<IActionResult> ObtenerUsuariosOG()
         {
             try
             {
@@ -583,6 +583,74 @@ namespace BusCheckInV2API.Controllers
             }
         }
 
+        // GET: api/WSBusCheckInV2/ObtenerUsuarios
+        [HttpGet("ObtenerUsuarios")]
+        public async Task<IActionResult> ObtenerUsuarios()
+        {
+            try
+            {
+                using var con = new SqlConnection(_connectionString);
+                await con.OpenAsync();
+
+                // FIX NIVEL 3 #22: Limita la muestra a los 500 fletes más recientes de la SEmana Laboral Actual.
+                // Rango Fijo: Desde el Lunes 00:00:00 hasta el Sábado 23:59:59 (menor que el Domingo 00:00:00).
+                const string query = @"
+            WITH FletesConEstado AS (
+               SELECT TOP 500
+                fp.IdFletePer,
+                fp.FlePer_Chofer,
+                CASE
+                    WHEN fp.FlePer_Status = 'P'
+                        OR (
+                            EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 0)
+                            AND NOT EXISTS (SELECT 1 FROM Tb_FlePer_DetFlete df WHERE df.IdFletePer = fp.IdFletePer AND df.FlePer_CveNomina = 9999 AND df.FlePer_Nombre = 'FIN')
+                        )
+                    THEN 1 ELSE 0
+                END AS EsPendiente
+               FROM Tb_FlePer_FletePersonal fp
+               WHERE fp.FlePer_Chofer IS NOT NULL
+                AND LTRIM(RTRIM(fp.FlePer_Chofer)) <> ''
+                -- FILTRO SEMANA LABORAL FIJA (Lunes a Sábado) --
+                AND fp.FlePer_Fecha >= DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0) -- Lunes 00:00
+                AND fp.FlePer_Fecha < DATEADD(DAY, 6, DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0)) -- Menor que Domingo 00:00
+               ORDER BY fp.FlePer_Fecha DESC
+        )
+        SELECT
+            FlePer_Chofer AS Nombre,
+            COUNT(*) AS TotalFletes,
+            SUM(EsPendiente) AS FletesPendientes
+            FROM FletesConEstado
+        GROUP BY FlePer_Chofer
+        ORDER BY FlePer_Chofer;";
+
+                using var cmd = new SqlCommand(query, con);
+                using var reader = await cmd.ExecuteReaderAsync();
+
+                var usuarios = new List<UsuarioResponse>();
+                while (await reader.ReadAsync())
+                {
+                    usuarios.Add(new UsuarioResponse
+                    {
+                        Nombre = reader["Nombre"].ToString(),
+                        TotalFletes = Convert.ToInt32(reader["TotalFletes"]),
+                        FletesPendientes = Convert.ToInt32(reader["FletesPendientes"])
+                    });
+                }
+
+                return Ok(new ApiResponse<List<UsuarioResponse>>
+                {
+                    Success = true,
+                    Data = usuarios,
+                    Message = $"Se encontraron {usuarios.Count} usuarios para la semana laboral en curso."
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error en ObtenerUsuarios con rango de semana laboral fija");
+                return StatusCode(500, new ApiResponse<object> { Success = false, Message = "Error interno del servidor" });
+            }
+        }
+
         [HttpGet("ObtenerFletesPorChoferTodos")]
         public async Task<IActionResult> ObtenerFletesPorChoferTodos(string chofer, int dias = 7)
         {
@@ -617,7 +685,8 @@ namespace BusCheckInV2API.Controllers
                     LEFT JOIN Tb_Cat_Proveedor p ON fp.Prov_Clave = p.prov_clave
                     LEFT JOIN Tb_FlePer_Ruta r ON fp.IdDestFlete = r.IdDestFlete
                     WHERE fp.FlePer_Chofer LIKE @Chofer
-                      AND fp.FlePer_Fecha >= DATEADD(DAY, -@Dias, CAST(GETDATE() AS DATE))
+                      AND fp.FlePer_Fecha >= DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0) -- Lunes 00:00
+                      AND fp.FlePer_Fecha < DATEADD(DAY, 6, DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0)) -- Menor que Domingo 00:00
                     ORDER BY fp.FlePer_Fecha DESC, fp.FlePer_Hora DESC";
 
                 using var cmd = new SqlCommand(query, con);
@@ -625,7 +694,7 @@ namespace BusCheckInV2API.Controllers
                 // ObtenerFletesPorChofer que sí lo hacía. Antes un chofer
                 // con espacios al final no matcheaba aquí.
                 cmd.Parameters.Add("@Chofer", SqlDbType.VarChar).Value = $"%{chofer.Trim()}%";
-                cmd.Parameters.Add("@Dias", SqlDbType.Int).Value = dias;
+                //cmd.Parameters.Add("@Dias", SqlDbType.Int).Value = dias;
 
                 using var reader = await cmd.ExecuteReaderAsync();
                 var fletes = new List<FleteResponse>();
@@ -783,7 +852,8 @@ namespace BusCheckInV2API.Controllers
                     LEFT JOIN Tb_Cat_Proveedor p ON fp.Prov_Clave = p.prov_clave
                     LEFT JOIN Tb_FlePer_Ruta r ON fp.IdDestFlete = r.IdDestFlete
                     WHERE fp.FlePer_Chofer LIKE @Chofer
-                      AND fp.FlePer_Fecha >= DATEADD(DAY, -@Dias, CAST(GETDATE() AS DATE)) ";
+                      AND fp.FlePer_Fecha >= DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0)
+                      AND fp.FlePer_Fecha < DATEADD(DAY, 6, DATEADD(WEEK, DATEDIFF(WEEK, 0, GETDATE()), 0)) ";
 
                 if (soloPendientes)
                 {
@@ -804,7 +874,7 @@ namespace BusCheckInV2API.Controllers
 
                 using var cmd = new SqlCommand(query, con);
                 cmd.Parameters.Add("@Chofer", SqlDbType.VarChar).Value = $"%{chofer.Trim()}%";
-                cmd.Parameters.Add("@Dias", SqlDbType.Int).Value = dias;
+                //cmd.Parameters.Add("@Dias", SqlDbType.Int).Value = dias;
 
                 using var reader = await cmd.ExecuteReaderAsync();
                 var fletes = new List<FleteResponse>();
@@ -900,7 +970,7 @@ namespace BusCheckInV2API.Controllers
                         SET FlePer_Cantidad     = @CantidadReal,
                             FlePer_FechaFin     = GETDATE(),
                             FlePer_Observaciones = @Observaciones,
-                            FlePer_Status       = 'F'
+                            FlePer_Status       = 'A'
                         WHERE IdFletePer = @IdFletePer";
 
                     using var cmdUpdate = new SqlCommand(updateFlete, con, transaction);
